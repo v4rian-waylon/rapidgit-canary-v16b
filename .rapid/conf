@@ -5,5 +5,3 @@ gates_fast=true
 gates_full=true
 gates_release=true
 forge_repo=v4rian-waylon/rapidgit-canary-v16b
-land_pr=required
-land_approvals=0
