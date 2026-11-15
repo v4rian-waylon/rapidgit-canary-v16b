@@ -1,0 +1,2 @@
+# Admins: one email per line. They alone change .rapid/conf and this file, in [MODE] commits, and release.
+canary@rapid-canary.invalid
