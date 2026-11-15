@@ -1,3 +1,12 @@
 rapid land feature/widget-261115003111 as v2026.0.2: merge tree 31138c1dc4c26b8975aa1183304b401d6bda6077
 
 gates deferred to the close of batch 9b1f022: no gate ran on this merge tree at the land
+
+close of batch 9b1f022: gates on the final tree 31138c1dc4c26b8975aa1183304b401d6bda6077
+
+gate=full
+command=true
+exit=0
+duration=0s
+at=2026-11-15T00:32:10Z
+--- log tail
