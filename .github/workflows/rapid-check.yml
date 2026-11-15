@@ -1,0 +1,165 @@
+# rapid-check: re-verifies on the forge what rapid land and rapid release already
+# checked locally, with a read-only token and no secrets; it never lands or
+# moves anything. The checker always comes from the protected base (dev's
+# committed .rapid; for a dev push, dev as it was before the push), never from
+# the commit under review, so a candidate cannot swap the code that judges it.
+# A repository that pins a release in .rapid/version instead of holding rapid
+# gets rapid installed in the runner (the installer of the pinned tag, RAPID_HOME in the
+# runner's temp directory); the pin is read from the base and written into the
+# runner's work tree, so the checker is the released rapid the base pins, never
+# the one the candidate's tree pins.
+# The gates it runs are still the candidate's own tests on the candidate's
+# tree, and a candidate can edit this workflow file: under land_pr=required the
+# dev ruleset therefore also requires approvals given after the last push.
+name: rapid-check
+on:
+  push:
+    branches: [dev, main, 'pool/**']
+  pull_request_review:
+    types: [submitted, dismissed]
+permissions:
+  contents: read
+  pull-requests: read
+jobs:
+  rapid-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0 # every branch and tag: the history checks walk them all
+          persist-credentials: false
+      - name: history invariants, branch commits and gate proofs, by dev's checker
+        env:
+          PUSHED_REF: ${{ github.event_name == 'pull_request_review' && format('refs/heads/{0}', github.event.pull_request.head.ref) || github.ref }}
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -eu
+          for b in dev main; do
+            if git rev-parse -q --verify "refs/remotes/origin/$b" >/dev/null; then
+              git update-ref "refs/heads/$b" "refs/remotes/origin/$b"
+            fi
+          done
+          zero=0000000000000000000000000000000000000000
+          base=refs/heads/dev
+          if [ "$PUSHED_REF" = refs/heads/dev ]; then
+            # dev itself moved: judge it with dev as it was before this push
+            if [ -n "${BEFORE:-}" ] && [ "$BEFORE" != "$zero" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+              base="$BEFORE"
+            else
+              base=$(git rev-list --first-parent --max-parents=0 refs/heads/dev | tail -n 1)
+            fi
+          fi
+          if git cat-file -e "$base:.rapid/rapid" 2>/dev/null; then
+            # the repository vendors rapid: the checker is the .rapid the base holds
+            trusted=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/rapid-trusted.XXXXXX")
+            git archive --format=tar -o "$trusted.tar" "$base" -- .rapid; tar -x -f "$trusted.tar" -C "$trusted"
+            rapid="$trusted/.rapid/rapid"
+          else
+            # the repository pins a release in .rapid/version and holds no rapid of its own: rapid is
+            # installed (RAPID_HOME in the runner's temp directory) and runs the tag the base pins
+            pin=$(git show "$base:.rapid/version" 2>/dev/null | sed -n 1p)
+            [ -n "$pin" ] || { echo "rapid-check: the base holds neither .rapid/rapid nor .rapid/version" >&2; exit 1; }
+            export RAPID_HOME="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/rapidgit"
+            mkdir -p "$HOME/.local/bin"; export PATH="$HOME/.local/bin:$PATH"
+            curl -fsSL "https://raw.githubusercontent.com/v4rian-io/rapidgit/$pin/.rapid/install.sh" | bash
+            git -C "$RAPID_HOME" rev-parse -q --verify "refs/tags/$pin^{commit}" >/dev/null \
+              || { echo "rapid-check: the installed rapid holds no tag $pin" >&2; exit 1; }
+            # the checker is the tag the base pins, never the one the candidate's tree pins: the
+            # runner's work tree takes the base's pin, which the installed rapid then runs
+            mkdir -p .rapid; printf '%s\n' "$pin" > .rapid/version
+            rapid=rapid
+          fi
+          echo "rapid-check: checker from $(git rev-parse --short "$base"), candidate $(git rev-parse --short HEAD)"
+          case "$PUSHED_REF" in
+            refs/heads/pool/*)
+              # a land --pr candidate (the merge as the head of the branch) is proven: shape, gates, approvals on it
+              if [ "$(git rev-list --parents -n1 HEAD | wc -w | tr -d ' ')" = 3 ]; then "$rapid" check --merge HEAD; else "$rapid" check --each; fi ;;
+            # every merge new on dev: its gates run again on its own tree, so a forged receipt fails here
+            refs/heads/dev) "$rapid" doctor --prove "${BEFORE:-}" ;;
+          esac
+          # the merges up to the base were checked when they arrived; the invariants that span history still run
+          "$rapid" doctor --history-only --since "$(git rev-parse "$base")"
+  commit-audit:
+    # the required commit audit (neo-git's required.commit-audit): every pushed branch commit and every
+    # branch of a new dev merge passes rapid check --audit, run by dev's checker; deterministic, no model
+    if: github.event_name == 'push' && github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: commit audit, by dev's checker
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -eu
+          if git rev-parse -q --verify refs/remotes/origin/dev >/dev/null; then git update-ref refs/heads/dev refs/remotes/origin/dev; fi
+          zero=0000000000000000000000000000000000000000
+          base=refs/heads/dev
+          if [ "$GITHUB_REF" = refs/heads/dev ]; then
+            if [ -n "${BEFORE:-}" ] && [ "$BEFORE" != "$zero" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then base="$BEFORE"
+            else base=$(git rev-list --first-parent --max-parents=0 refs/heads/dev | tail -n 1); fi
+          fi
+          if git cat-file -e "$base:.rapid/rapid" 2>/dev/null; then
+            # the repository vendors rapid: the checker is the .rapid the base holds
+            trusted=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/rapid-trusted.XXXXXX")
+            git archive --format=tar -o "$trusted.tar" "$base" -- .rapid; tar -x -f "$trusted.tar" -C "$trusted"
+            rapid="$trusted/.rapid/rapid"
+          else
+            # the repository pins a release in .rapid/version and holds no rapid of its own: rapid is
+            # installed (RAPID_HOME in the runner's temp directory) and runs the tag the base pins
+            pin=$(git show "$base:.rapid/version" 2>/dev/null | sed -n 1p)
+            [ -n "$pin" ] || { echo "commit-audit: the base holds neither .rapid/rapid nor .rapid/version" >&2; exit 1; }
+            export RAPID_HOME="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/rapidgit"
+            mkdir -p "$HOME/.local/bin"; export PATH="$HOME/.local/bin:$PATH"
+            curl -fsSL "https://raw.githubusercontent.com/v4rian-io/rapidgit/$pin/.rapid/install.sh" | bash
+            git -C "$RAPID_HOME" rev-parse -q --verify "refs/tags/$pin^{commit}" >/dev/null \
+              || { echo "commit-audit: the installed rapid holds no tag $pin" >&2; exit 1; }
+            # the checker is the tag the base pins, never the one the candidate's tree pins: the
+            # runner's work tree takes the base's pin, which the installed rapid then runs
+            mkdir -p .rapid; printf '%s\n' "$pin" > .rapid/version
+            rapid=rapid
+          fi
+          if [ "$GITHUB_REF" = refs/heads/dev ]; then
+            for m in $(git rev-list --first-parent --reverse "$base..HEAD"); do "$rapid" check --audit "$m"; done
+          else
+            "$rapid" check --audit HEAD
+          fi
+  rapid-linux:
+    # the full gate on Linux (bash 5, GNU tools) for every branch and dev push
+    if: github.event_name == 'push' && github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: full gate on Linux, by dev's checker
+        run: |
+          set -eu
+          echo "rapid-linux: $(uname -s), bash $(bash -c 'echo $BASH_VERSION')"
+          if git rev-parse -q --verify refs/remotes/origin/dev >/dev/null; then git update-ref refs/heads/dev refs/remotes/origin/dev; fi
+          if git cat-file -e refs/heads/dev:.rapid/rapid 2>/dev/null; then
+            # the repository vendors rapid: the checker is the .rapid dev holds
+            trusted=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/rapid-trusted.XXXXXX")
+            git archive --format=tar -o "$trusted.tar" refs/heads/dev -- .rapid; tar -x -f "$trusted.tar" -C "$trusted"
+            rapid="$trusted/.rapid/rapid"
+          else
+            # the repository pins a release in .rapid/version and holds no rapid of its own: rapid is
+            # installed (RAPID_HOME in the runner's temp directory) and runs the tag the base pins
+            pin=$(git show "refs/heads/dev:.rapid/version" 2>/dev/null | sed -n 1p)
+            [ -n "$pin" ] || { echo "rapid-linux: the base holds neither .rapid/rapid nor .rapid/version" >&2; exit 1; }
+            export RAPID_HOME="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/rapidgit"
+            mkdir -p "$HOME/.local/bin"; export PATH="$HOME/.local/bin:$PATH"
+            curl -fsSL "https://raw.githubusercontent.com/v4rian-io/rapidgit/$pin/.rapid/install.sh" | bash
+            git -C "$RAPID_HOME" rev-parse -q --verify "refs/tags/$pin^{commit}" >/dev/null \
+              || { echo "rapid-linux: the installed rapid holds no tag $pin" >&2; exit 1; }
+            # the checker is the tag the base pins, never the one the candidate's tree pins: the
+            # runner's work tree takes the base's pin, which the installed rapid then runs
+            mkdir -p .rapid; printf '%s\n' "$pin" > .rapid/version
+            rapid=rapid
+          fi
+          RAPID_CONF_REV=refs/heads/dev "$rapid" check --gate full
